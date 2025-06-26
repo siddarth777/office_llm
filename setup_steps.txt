@@ -1,0 +1,28 @@
+NGNX:
+
+sudo systemctl start nginx
+
+sudo tee /etc/nginx/conf.d/llama-balancer.conf > /dev/null << 'EOF'
+upstream llama_servers {
+    least_conn;
+    server 127.0.0.1:8082; //llama_instances
+}
+
+server {
+    listen 8080;
+    server_name localhost;
+
+    location / {
+        proxy_pass http://llama_servers;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOF
+
+sudo nginx -t
+sudo systemctl reload nginx
+

@@ -2,7 +2,7 @@ import os
 import time
 import signal
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse,StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import mimetypes
@@ -22,14 +22,13 @@ import asyncio
 
 import httpx
 import subprocess
+import json
 
 from faster_whisper import WhisperModel
 
 
 "python -m vllm.entrypoints.openai.api_server --model facebook/opt-125m --host 0.0.0.0 --port 8080 --served-model-name facebook/opt-125m --disable-log-requests --tensor-parallel-size 1 --dtype auto --max-model-len 4096"
 
-
-""" vllm serve "TechxGenus/Meta-Llama-3-8B-Instruct-AWQ" """
 
 current_model = 'llama3.1:8b'
 ollama_process = None
@@ -144,93 +143,256 @@ class MessageResponse(BaseModel):
 @app.post("/message", response_model=MessageResponse)
 async def send_message(request: MessageRequest):
     """
-    Send a message to the current vLLM model
+    Send a message to the current llama.cpp model
     """
     history = request.chatHistory
     prompt = request.message
+    
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     
-    print(current_model)
-    final_prompt = f"""You are a helpful AI assistant 'V'. Provide accurate, concise, and engaging responses.
-GUIDELINES:
-Be conversational and friendly while staying professional
-Give direct answers with relevant context
-Acknowledge uncertainty rather than guessing
-Use chat history to maintain context and avoid repetition
-Ask clarifying questions when needed
-
-CHAT HISTORY:
-{history if history else "No previous conversation"}
-
-CURRENT USER MESSAGE:
-{prompt}
-
-Respond helpfully to the user's message, referencing previous conversation when relevant."""
+    print(f"Current model: {current_model}")
     
-    print(final_prompt)
+    # Generating Chat History
+    messages = []
+    
+    # Add system messages
+    messages.append({
+        "role": "system",
+        "content": "You are a helpful AI assistant 'V'. Provide accurate, concise, and engaging responses. Be conversational and friendly while staying professional. Give direct answers with relevant context. Acknowledge uncertainty rather than guessing. Ask clarifying questions when needed."
+    })
+    
+    if history and history.strip():
+        #messages seperate by \n
+        lines = history.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('V: '):
+                messages.append({
+                    "role": "assistant",
+                    "content": line[3:]  # Remove 'V: '
+                })
+            elif line.startswith('User: '):
+                messages.append({
+                    "role": "user",
+                    "content": line[6:]  # Remove 'User: '
+                })
+    
+    # Add current user message
+    messages.append({
+        "role": "user",
+        "content": prompt
+    })
+    
+    print(f"Messages to send: {messages}")
     
     try:
-        # Check if Ollama is running
+        # Check if llama.cpp server is running
         async with httpx.AsyncClient(timeout=60.0) as client:
             # Test connection first
             try:
-                await client.get("http://localhost:11434/api/tags", timeout=5.0)
+                await client.get("http://localhost:8080/health", timeout=5.0)
             except Exception:
-                raise HTTPException(status_code=503, detail="Ollama server is not responding")
+                # Fallback health check if /health doesn't exist
+                try:
+                    await client.get("http://localhost:8080/v1/models", timeout=5.0)
+                except Exception:
+                    raise HTTPException(status_code=503, detail="llama.cpp server is not responding")
             
-            # Send the generation request
-            print(f"Sending request to model: {current_model}")
+            # Open API standard call
+            print(f"Sending request to llama.cpp server")
             response = await client.post(
-                url="http://localhost:11434/api/generate",
+                url="http://localhost:8080/v1/chat/completions",
                 json={
                     "model": current_model,
-                    "prompt": final_prompt,
+                    "messages": messages,
+                    "temperature": 0.3,
+                    "top_p": 0.95,
+                    "max_tokens": 1000,
                     "stream": False,
-                    "options": {
-                        "temperature": 0.3,
-                        "top_p": 0.95,
-                        "max_tokens": 1000,
-                        "stop": ["<SUF>", "<PRE>", "</PRE>", "</SUF>", "< EOT >", "\\end", "<MID>", "</MID>", "##"]
-                    }
+                    "stop": ["<|eot_id|>", "<|end_of_text|>"]
                 },
-                timeout=60.0
+                headers={
+                    "Content-Type": "application/json"
+                },
+                timeout=120.0
             )
             
             if response.status_code != 200:
-                print(f"Ollama API error: {response.status_code} - {response.text}")
+                print(f"llama.cpp API error: {response.status_code} - {response.text}")
                 raise HTTPException(
-                    status_code=500, 
-                    detail=f"Ollama API returned status {response.status_code}"
+                    status_code=500,
+                    detail=f"llama.cpp API returned status {response.status_code}"
                 )
             
             data = response.json()
             
-            if "response" not in data:
+            # Parse OpenAI-style response
+            if "choices" not in data or not data["choices"]:
                 print(f"Unexpected response format: {data}")
                 raise HTTPException(
-                    status_code=500, 
-                    detail="Invalid response format from Ollama"
+                    status_code=500,
+                    detail="Invalid response format from llama.cpp server"
                 )
             
-            ai_response = data["response"].strip()
+            ai_response = data["choices"][0]["message"]["content"].strip()
             
             if not ai_response:
                 ai_response = "I apologize, but I couldn't generate a response. Please try again."
             
-            print(f"Generated response:\n {ai_response}")
-            
+            print(f"Generated response:\n{ai_response}")
             return MessageResponse(message=ai_response)
-
+            
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Ollama Error: {str(e)}")
+        print(f"llama.cpp Error: {str(e)}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Error generating response: {str(e)}"
         )
-  
+
+@app.post("/message/stream")
+async def send_message_stream(request: MessageRequest):
+    """
+    Send a message to the current llama.cpp model with streaming response
+    """
+    history = request.chatHistory
+    prompt = request.message
+    
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    
+    print(f"Current model: {current_model}")
+    
+    # Generating Chat History
+    messages = []
+    
+    # Add system messages
+    messages.append({
+        "role": "system",
+        "content": "You are a helpful AI assistant 'V'. Provide accurate, concise, and engaging responses. Be conversational and friendly while staying professional. Give direct answers with relevant context. Acknowledge uncertainty rather than guessing. Ask clarifying questions when needed."
+    })
+    
+    if history and history.strip():
+        #messages seperate by \n
+        lines = history.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('V: '):
+                messages.append({
+                    "role": "assistant",
+                    "content": line[3:]  # Remove 'V: '
+                })
+            elif line.startswith('User: '):
+                messages.append({
+                    "role": "user",
+                    "content": line[6:]  # Remove 'User: '
+                })
+    
+    # Add current user message
+    messages.append({
+        "role": "user",
+        "content": prompt
+    })
+    
+    print(f"Messages to send: {messages}")
+    
+    async def generate_stream():
+        try:
+            # Check if llama.cpp server is running
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                # Test connection first
+                try:
+                    await client.get("http://localhost:8080/health", timeout=5.0)
+                except Exception:
+                    # Fallback health check if /health doesn't exist
+                    try:
+                        await client.get("http://localhost:8080/v1/models", timeout=5.0)
+                    except Exception:
+                        yield f"data: {json.dumps({'error': 'llama.cpp server is not responding'})}\n\n"
+                        return
+                
+                # Open API standard call with streaming
+                print(f"Sending streaming request to llama.cpp server")
+                
+                async with client.stream(
+                    method="POST",
+                    url="http://localhost:8080/v1/chat/completions",
+                    json={
+                        "model": current_model,
+                        "messages": messages,
+                        "temperature": 0.3,
+                        "top_p": 0.95,
+                        "max_tokens": 1000,
+                        "stream": True,  # Enable streaming
+                        "stop": ["<|eot_id|>", "<|end_of_text|>"]
+                    },
+                    headers={
+                        "Content-Type": "application/json"
+                    },
+                    timeout=180.0
+                ) as response:
+                    
+                    if response.status_code != 200:
+                        print(f"llama.cpp API error: {response.status_code}")
+                        yield f"data: {json.dumps({'error': f'llama.cpp API returned status {response.status_code}'})}\n\n"
+                        return
+                    
+                    # Process streaming response
+                    async for chunk in response.aiter_lines():
+                        if chunk:
+                            # Remove 'data: ' prefix if present
+                            if chunk.startswith('data: '):
+                                chunk = chunk[6:]
+                            
+                            # Skip empty lines and [DONE] marker
+                            if not chunk.strip() or chunk.strip() == '[DONE]':
+                                continue
+                            
+                            try:
+                                # Parse the JSON chunk
+                                data = json.loads(chunk)
+                                
+                                # Extract the content from OpenAI-style streaming response
+                                if "choices" in data and data["choices"]:
+                                    choice = data["choices"][0]
+                                    if "delta" in choice and "content" in choice["delta"]:
+                                        content = choice["delta"]["content"]
+                                        if content:
+                                            # Send the token to the frontend
+                                            yield f"data: {json.dumps({'token': content})}\n\n"
+                                    
+                                    # Check if streaming is finished
+                                    if choice.get("finish_reason"):
+                                        yield f"data: {json.dumps({'done': True})}\n\n"
+                                        break
+                                        
+                            except json.JSONDecodeError as e:
+                                print(f"JSON decode error: {e}, chunk: {chunk}")
+                                continue
+                            except Exception as e:
+                                print(f"Error processing chunk: {e}")
+                                continue
+                
+        except HTTPException:
+            yield f"data: {json.dumps({'error': 'HTTP exception occurred'})}\n\n"
+        except Exception as e:
+            print(f"llama.cpp Streaming Error: {str(e)}")
+            yield f"data: {json.dumps({'error': f'Error generating response: {str(e)}'})}\n\n"
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+    )
+
 @app.get("/models")
 async def get_available_models():
     """
@@ -656,3 +818,9 @@ async def speech_to_text(audio: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+"""
+export LD_LIBRARY_PATH=build/ggml/src:build/src/:$LD_LIBRARY_PATH
+
+./build/bin/llama-server -m /home/caio/Downloads/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf -c 2048 --port 8080 --host 0.0.0.0 --chat-template llama3
+"""

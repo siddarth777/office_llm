@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Send, Paperclip, LogOut, User, Moon, Sun, Trash2, Bot, Zap, Mic, MicOff } from 'lucide-react';
+import { Send, Paperclip, LogOut, User, Moon, Sun, Trash2, Bot, X, FileText, Square } from 'lucide-react';
 import ChatMessage from './ChatMessage';
 
 //http://127.0.0.1:8000
@@ -16,16 +16,14 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
   ]);
   const [inputText, setInputText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
   const [currentModel, setCurrentModel] = useState('model1'); // Default model
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
-  
-  // Speech recording states
-  const [isRecording, setIsRecording] = useState(false);
-  const [isProcessingAudio, setIsProcessingAudio] = useState(false);
-  
+  const [hasUploadedDocuments, setHasUploadedDocuments] = useState(false);
+  const [ragSessionId, setRagSessionId] = useState(null); // Add RAG session management
+  const [uploadedFileName, setUploadedFileName] = useState(''); // Store uploaded file name
+  const [abortController, setAbortController] = useState(null); // For cancelling requests
   const fileInputRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
 
   // Model configurations
   const models = {
@@ -35,6 +33,43 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
       icon: <Bot size={16} />,
       description: 'Balanced performance model'
     },
+  };
+
+
+  // Create RAG session
+  const createRagSession = async () => {
+    try {
+      const response = await fetch(`${BACKEND_PATH}/rag/create-session`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        }
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        setRagSessionId(data.session_id);
+        return data.session_id;
+      }
+    } catch (error) {
+      console.error('Error creating RAG session:', error);
+    }
+    return null;
+  };
+
+  // Delete RAG session and uploaded file
+  const deleteRagSession = async () => {
+    if (!ragSessionId) return;
+    
+    try {
+      await fetch(`${BACKEND_PATH}/rag/document/${ragSessionId}`, {
+        method: 'DELETE'
+      });
+      setHasUploadedDocuments(false);
+      setUploadedFileName('');
+    } catch (error) {
+      console.error('Error clearing RAG documents:', error);
+    }
   };
 
   // Close dropdown when clicking outside
@@ -51,6 +86,27 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
     };
   }, [isDropdownOpen]);
 
+  // Create RAG session on component mount
+  React.useEffect(() => {
+    const initializeRagSession = async () => {
+      const sessionId = await createRagSession();
+      if (sessionId) {
+        // Check if session has documents
+        try {
+          const response = await fetch(`${BACKEND_PATH}/rag/session/${sessionId}/status`);
+          if (response.ok) {
+            const data = await response.json();
+            setHasUploadedDocuments(data.has_document && data.chunks_count > 0);
+          }
+        } catch (error) {
+          console.error('Error checking RAG status:', error);
+        }
+      }
+    };
+
+    initializeRagSession();
+  }, [user]);
+
   // Initial greeting message
   const getInitialMessage = () => ({
     id: 1,
@@ -65,94 +121,6 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
       const role = msg.sender === 'user' ? 'User' : 'V';
       return `${role}: ${msg.text}`;
     }).join('\n');
-  };
-
-  // Speech recording functions
-  const startRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          sampleRate: 44100,
-        }
-      });
-
-      mediaRecorderRef.current = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      });
-
-      audioChunksRef.current = [];
-
-      mediaRecorderRef.current.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      mediaRecorderRef.current.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
-        await sendAudioToBackend(audioBlob);
-        
-        // Stop all tracks to release microphone
-        stream.getTracks().forEach(track => track.stop());
-      };
-
-      mediaRecorderRef.current.start(1000); // Collect data every second
-      setIsRecording(true);
-    } catch (error) {
-      console.error('Error starting recording:', error);
-      alert('Could not access microphone. Please check your permissions.');
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      setIsProcessingAudio(true);
-    }
-  };
-
-  const sendAudioToBackend = async (audioBlob) => {
-    try {
-      const formData = new FormData();
-      formData.append('audio', audioBlob, 'recording.webm');
-
-      const response = await fetch(BACKEND_PATH + '/speech-to-text', {
-        method: 'POST',
-        body: formData
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const data = await response.json();
-      
-      // Add transcribed text to input box
-      if (data.text) {
-        setInputText(prev => prev + (prev ? ' ' : '') + data.text);
-      } else if (data.transcription) {
-        setInputText(prev => prev + (prev ? ' ' : '') + data.transcription);
-      } else {
-        console.warn('No text received from speech-to-text service');
-      }
-
-    } catch (error) {
-      console.error('Error processing audio:', error);
-      alert('Failed to process audio. Please try again.');
-    } finally {
-      setIsProcessingAudio(false);
-    }
-  };
-
-  const toggleRecording = () => {
-    if (isRecording) {
-      stopRecording();
-    } else {
-      startRecording();
-    }
   };
 
   const handleModelSwitch = async (newModel) => {
@@ -209,14 +177,19 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
 
   const handleSendMessage = async (e) => {
     e.preventDefault();
-    if (!inputText.trim()) return;
-    
+    if (!inputText.trim() || isTyping) return; // Prevent sending while typing
+
     // Convert chat history to string
     const chatHistoryString = messagesToString(messages);
-    
     const currentInput = inputText;
     setInputText('');
     setIsTyping(true);
+    setIsThinking(true);
+    let thinking=true;
+
+    // Create abort controller for this request
+    const controller = new AbortController();
+    setAbortController(controller);
 
     const userMessage = {
       id: Date.now(),
@@ -229,8 +202,19 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
     const updatedMessages = [...messages, userMessage];
     setMessages(updatedMessages);
 
+    // Create initial AI message that will be updated with streaming content
+    const aiMessageId = Date.now() + 1;
+    const initialAiMessage = {
+      id: aiMessageId,
+      text: '',
+      sender: 'varuna',
+      timestamp: new Date(),
+      isStreaming: true
+    };
+
+    let accumulatedText = '';
     try {
-      const response = await fetch(BACKEND_PATH+'/message', {
+      const response = await fetch(`${BACKEND_PATH}/message/stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -238,44 +222,133 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
         body: JSON.stringify({
           message: currentInput,
           chatHistory: chatHistoryString,
-          model: currentModel // Include current model in the request
-        })
+          model: currentModel,
+          ragStatus: !!(hasUploadedDocuments && ragSessionId),
+          session_id : ragSessionId
+        }),
+        signal: controller.signal // Add abort signal
       });
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
-      const data = await response.json();
-      
-      const apiResponse = {
-        id: Date.now() + 1,
-        text: data.response || data.message || 'No response received',
-        sender: 'varuna',
-        timestamp: new Date()
-      };
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
 
-      setMessages(prev => [...prev, apiResponse]);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done){
+          console.log("done")
+          break;
+        }
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data.trim() === '') continue;
+
+            try {
+              const parsed = JSON.parse(data);
+              
+              if (parsed.error) {
+                throw new Error(parsed.error);
+              }
+              
+              if (parsed.token) {
+                if (thinking===true){
+                  //disable 3 dots when stream starts
+                  thinking=false
+                  setIsThinking(false);
+                  // Add the initial AI message to the chat
+                  setMessages(prev => [...prev, initialAiMessage]);
+                }
+                // Accumulate the token
+                accumulatedText += parsed.token;
+                
+                // Update the AI message with the new accumulated text
+                setMessages(prev => prev.map(msg => 
+                  msg.id === aiMessageId 
+                    ? { ...msg, text: accumulatedText +'...' }
+                    : msg
+                ));
+              }
+              
+              if (parsed.done) {
+                // Mark streaming as complete
+                setMessages(prev => prev.map(msg => 
+                  msg.id === aiMessageId 
+                    ? { ...msg,text: accumulatedText, isStreaming: false }
+                    : msg
+                ));
+                console.log("parser finished")
+                return; // Exit the function
+              }
+            } catch (parseError) {
+              console.error('Error parsing streaming data:', parseError);
+            }
+          }
+        }
+      }
+
+      // If we reach here without getting a 'done' signal, mark as complete
+      setMessages(prev => prev.map(msg => 
+        msg.id === aiMessageId 
+          ? { ...msg, isStreaming: false }
+          : msg
+      ));
+
     } catch (error) {
       console.error('Error sending message:', error);
       
-      const errorResponse = {
-        id: Date.now() + 1,
-        text: 'Sorry, I encountered an error while processing your message. Please try again.',
-        sender: 'varuna',
-        timestamp: new Date()
-      };
-
-      setMessages(prev => [...prev, errorResponse]);
+      // Check if it was aborted
+      if (error.name === 'AbortError') {
+        // Update the message to show it was stopped
+        setMessages(prev => prev.map(msg => 
+          msg.id === aiMessageId 
+            ? { ...msg, text: accumulatedText || 'Response stopped by user.', isStreaming: false }
+            : msg
+        ));
+      } else {
+        // Remove the streaming message and add error message
+        setMessages(prev => {
+          const filteredMessages = prev.filter(msg => msg.id !== aiMessageId);
+          const errorResponse = {
+            id: Date.now() + 1,
+            text: 'Sorry, I encountered an error while processing your message. Please try again.',
+            sender: 'varuna',
+            timestamp: new Date(),
+            isError: true
+          };
+          return [...filteredMessages, errorResponse];
+        });
+      }
     } finally {
+      setIsTyping(false);
+      setAbortController(null);
+    }
+  };
+
+  const handleStopGeneration = () => {
+    if (abortController) {
+      abortController.abort();
+      setAbortController(null);
       setIsTyping(false);
     }
   };
 
-  const handleClearChat = () => {
+  const handleClearChat = async () => {
     setMessages([getInitialMessage()]);
     setInputText('');
     setIsTyping(false);
+    
+    // Clear RAG documents if session exists
+    if (ragSessionId && hasUploadedDocuments) {
+      await deleteRagSession();
+    }
   };
 
   const handleFileAttach = () => {
@@ -288,53 +361,62 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
 
     console.log('File selected:', file.name);
 
-    // Add a file message to the chat
-    const fileMessage = {
-      id: Date.now(),
-      text: `📎 Uploaded file: ${file.name}`,
-      sender: 'user',
-      timestamp: new Date(),
-      isFile: true
-    };
+    // Validate file type
+    const allowedTypes = ['.pdf', '.txt', '.docx', '.doc'];
+    const fileExtension = '.' + file.name.split('.').pop().toLowerCase();
+    
+    if (!allowedTypes.includes(fileExtension)) {
+      alert(`Unsupported file type. Please upload: ${allowedTypes.join(', ')}`);
+      return;
+    }
 
-    setMessages(prev => [...prev, fileMessage]);
+    // Ensure we have a RAG session
+    let sessionId = ragSessionId;
+    if (!sessionId) {
+      sessionId = await createRagSession();
+      if (!sessionId) {
+        alert('Failed to create RAG session. Please try again.');
+        return;
+      }
+    }
+
+    // Set typing state to show loading
     setIsTyping(true);
 
     try {
       const formData = new FormData();
       formData.append('file', file);
-      formData.append('model', currentModel); // Include current model
 
-      const response = await fetch(BACKEND_PATH+'/upload', {
+      const response = await fetch(`${BACKEND_PATH}/rag/upload/${sessionId}`, {
         method: 'POST',
         body: formData
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
       }
 
       const data = await response.json();
       
-      const apiResponse = {
-        id: Date.now() + 1,
-        text: data.response || data.message || 'File uploaded successfully',
-        sender: 'varuna',
-        timestamp: new Date()
-      };
-
-      setMessages(prev => [...prev, apiResponse]);
+      if (data.status === 'success') {
+        setHasUploadedDocuments(true);
+        setUploadedFileName(file.name);
+      } else {
+        throw new Error(data.message || 'Upload failed');
+      }
+      
     } catch (error) {
       console.error('Error uploading file:', error);
       
-      const errorResponse = {
-        id: Date.now() + 1,
-        text: 'Sorry, I encountered an error while uploading the file. Please try again.',
+      const errorMessage = {
+        id: Date.now(),
+        text: `❌ Sorry, I encountered an error while uploading the file: ${error.message}. Please try again.`,
         sender: 'varuna',
         timestamp: new Date()
       };
 
-      setMessages(prev => [...prev, errorResponse]);
+      setMessages(prev => [...prev, errorMessage]);
     } finally {
       setIsTyping(false);
       // Clear the file input
@@ -349,7 +431,7 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
       <header className="chat-header">
         <div className="header-content">
           <div className="header-left">
-            <h1>V Chat</h1>
+            <h1>V Chat {hasUploadedDocuments && <span className="rag-indicator">📚 RAG</span>}</h1>
             <div className="model-selector">
               <div className="model-dropdown">
                 <button
@@ -433,7 +515,7 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
         {messages.map(message => (
           <ChatMessage key={message.id} message={message} />
         ))}
-        {isTyping && (
+        {isThinking && (
           <div className="typing-indicator">
             <div className="typing-message">
               <div className="avatar varuna-avatar">V</div>
@@ -447,48 +529,67 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
         )}
       </div>
 
+      {/* Thinking indicator */}
+      {isTyping && (
+        <div className="thinking-indicator">
+          <div className="thinking-content">
+            <Bot size={16} className="thinking-icon" />
+            <span className="thinking-text">Varuna is thinking</span>
+            <div className="thinking-dots">
+              <span className="dot"></span>
+              <span className="dot"></span>
+              <span className="dot"></span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* File indicator above chat input */}
+      {hasUploadedDocuments && uploadedFileName && (
+        <div className="file-indicator">
+          <div className={`file-item ${uploadedFileName.split('.').pop().toLowerCase()}`}>
+            <FileText size={16} className="file-icon" />
+            <span className="file-name">{uploadedFileName}</span>
+            <button 
+              onClick={deleteRagSession}
+              className="file-delete-button"
+              title="Remove uploaded file"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+
       <form onSubmit={handleSendMessage} className="chat-input-form">
         <div className="input-container">
           <button
             type="button"
             onClick={handleFileAttach}
             className="attach-button"
-            title="Attach file"
+            title="Attach file for RAG processing (PDF, TXT, DOCX)"
+            disabled={isTyping}
           >
             <Paperclip size={20} />
-          </button>
-          
-          <button
-            type="button"
-            onClick={toggleRecording}
-            className={`speech-button ${isRecording ? 'recording' : ''} ${isProcessingAudio ? 'processing' : ''}`}
-            title={isRecording ? 'Stop recording' : isProcessingAudio ? 'Processing audio...' : 'Start voice recording'}
-            disabled={isProcessingAudio}
-          >
-            {isProcessingAudio ? (
-              <div className="processing-spinner">
-                <div className="spinner"></div>
-              </div>
-            ) : 
-              <Mic size={20}/>
-            }
           </button>
           
           <input
             type="text"
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
-            placeholder={`Message V (${models[currentModel].name})...`}
+            placeholder={`Message V (${models[currentModel].name})${hasUploadedDocuments ? ' - RAG enabled' : ''}...`}
             className="chat-input"
+            disabled={isTyping}
           />
           
           <button 
             type="submit" 
-            className="send-button"
-            disabled={!inputText.trim()}
-            title="Send message"
+            className={`send-button ${isTyping ? 'stop-button' : ''}`}
+            disabled={(!inputText.trim() && !isTyping)}
+            title={isTyping ? "Stop generation" : "Send message"}
+            onClick={isTyping ? handleStopGeneration : undefined}
           >
-            <Send size={20} />
+            {isTyping ? <Square size={20} /> : <Send size={20} />}
           </button>
         </div>
         
@@ -497,7 +598,7 @@ const ChatInterface = ({ user, onLogout, darkMode, toggleDarkMode }) => {
           ref={fileInputRef}
           onChange={handleFileSelect}
           style={{ display: 'none' }}
-          accept="*/*"
+          accept=".pdf,.txt,.docx,.doc"
         />
       </form>
     </div>
