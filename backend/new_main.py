@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 
 from database.database import engine, AsyncSessionLocal
 from database.models import Base, User
-from database.crud import create_user, authenticate_user
+from database.crud import create_user, authenticate_user, get_user_by_username
 
 import httpx
 import json
@@ -139,6 +139,35 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     message: str
     username: str
+
+@app.post("/register")
+async def register_user(request: LoginRequest):
+    username = request.username
+    password = request.password
+    
+    async with AsyncSessionLocal() as db:
+        user = await get_user_by_username(db, username)
+        if not user:
+            # User doesn't exist, create new user
+            new_user = await create_user(db, username, password)
+            if new_user:
+                return {
+                    "message": "User registered successfully",
+                    "username": username,
+                    "status": "success"
+                }
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to create user. Please try again."
+                )
+        else:
+            # User already exists
+            raise HTTPException(
+                status_code=409,
+                detail="Username already in use"
+            )
+        
 
 @app.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
